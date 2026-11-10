@@ -3,37 +3,47 @@ on:
   workflow_call:
     inputs:
       expected_size2:
-        description: 'Second expected signature size (for PR builds)'
+        description: 'Second expected signature size (FinaSU manager cert DER size, hex)'
         required: false
-        default: ''
+        default: '0x0672'
         type: string
       expected_hash2:
-        description: 'Second expected signature hash (for PR builds)'
+        description: 'Second expected signature hash (FinaSU manager cert SHA256)'
         required: false
-        default: ''
+        default: '2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458'
         type: string
       second_signature_release:
         description: 'Set to 1 when the second signature slot holds a release key instead of a PR key'
         required: false
-        default: ''
+        default: '1'
         type: string
   workflow_dispatch:
+    inputs:
+      expected_size2:
+        description: 'FinaSU manager cert DER size in hex (pre-filled, do not change)'
+        required: false
+        default: '0x0672'
+        type: string
+      expected_hash2:
+        description: 'FinaSU manager cert SHA256 (pre-filled, do not change)'
+        required: false
+        default: '2d89b50aaf1db013c2b6738f973f48b62ea21a3a8d7216bfec3521065d448458'
+        type: string
+      second_signature_release:
+        description: '1 = release key'
+        required: false
+        default: '1'
+        type: string
+
 jobs:
   build-lkm:
     strategy:
       matrix:
         kmi:
-          - android12-5.10
-          - android13-5.10
-          - android13-5.15
-          - android14-5.15
-          - android14-6.1
-          - android15-6.6
-          - android16-6.12
           - android17-6.18
     uses: ./.github/workflows/ddk-lkm.yml
     with:
       kmi: ${{ matrix.kmi }}
-      expected_size2: ${{ inputs.expected_size2 || '' }}
-      expected_hash2: ${{ inputs.expected_hash2 || '' }}
-      second_signature_release: ${{ inputs.second_signature_release || '' }}
+      expected_size2: ${{ inputs.expected_size2 }}
+      expected_hash2: ${{ inputs.expected_hash2 }}
+      second_signature_release: ${{ inputs.second_signature_release }}
