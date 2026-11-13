@@ -1,1 +1,157 @@
-
+--- a/kernel/feature/mount_view_filter.c
++++ b/kernel/feature/mount_view_filter.c
+@@ -5,8 +5,10 @@
+ #include <linux/dcache.h>
+ #include <linux/err.h>
+ #include <linux/fs.h>
++#include <linux/gfp.h>
+ #include <linux/init.h>
+ #include <linux/kernel.h>
++#include <linux/kprobes.h>
+ #include <linux/mount.h>
+ #include <linux/mutex.h>
+ #include <linux/path.h>
+@@ -15,6 +17,7 @@
+ #include <linux/sched.h>
+ #include <linux/seq_file.h>
+ #include <linux/string.h>
++#include <linux/xarray.h>
+ 
+ #include "feature/kernel_umount.h"
+ #include "hook/patch_memory.h"
+@@ -46,7 +49,11 @@
+     ksu_mvf_show_fn filtered_show;
+     ksu_mvf_open_fn *open_slot;
+     ksu_mvf_open_fn original_open;
++    /* kprobe fallback: used when the open slot itself is write protected */
++    ksu_mvf_open_fn replacement;
++    struct kprobe kp;
+     bool patched;
++    bool kprobed;
+ };
+ 
+ static DEFINE_MUTEX(ksu_mvf_mutex);
+@@ -59,9 +66,20 @@
+     return show(m, mnt);
+ }
+ 
++/* defined with the kprobe fallback below; call_open marks the task around the
++ * nested call into the probed original */
++static void ksu_mvf_task_mark(void);
++static void ksu_mvf_task_clear(void);
++
+ static int __nocfi ksu_mvf_call_open(ksu_mvf_open_fn open, struct inode *inode, struct file *file)
+ {
+-    return open(inode, file);
++    int ret;
++
++    ksu_mvf_task_mark();
++    ret = open(inode, file);
++    ksu_mvf_task_clear();
++
++    return ret;
+ }
+ 
+ static bool ksu_mvf_char_equal(char a, char b)
+@@ -317,6 +335,64 @@
+     return wrappers[index];
+ }
+ 
++/*
++ * kprobe fallback for the open-slot patch.
++ *
++ * Some vendor kernels write protect proc_mounts_operations and friends (the page is
++ * mapped read-only at EL2, so ksu_patch_text() fails with -EFAULT). Hooking the original
++ * open function and pointing the PC at our wrapper gives the same effect; the kprobe
++ * leaves x30 alone, so the wrapper's return goes straight back to the caller.
++ *
++ * The wrapper calls original_open, which trips the same probe again: mark the task while
++ * that call is in flight (see ksu_mvf_call_open) and let the nested hit run the original.
++ */
++static DEFINE_XARRAY(ksu_mvf_tasks);
++
++static bool ksu_mvf_task_marked(void)
++{
++    return xa_load(&ksu_mvf_tasks, (unsigned long)current) != NULL;
++}
++
++static void ksu_mvf_task_mark(void)
++{
++    xa_store(&ksu_mvf_tasks, (unsigned long)current, xa_mk_value(1), GFP_ATOMIC);
++}
++
++static void ksu_mvf_task_clear(void)
++{
++    xa_erase(&ksu_mvf_tasks, (unsigned long)current);
++}
++
++#if defined(__aarch64__)
++#define ksu_mvf_set_pc(regs, addr) ((regs)->pc = (unsigned long)(addr))
++#elif defined(__x86_64__)
++#define ksu_mvf_set_pc(regs, addr) ((regs)->ip = (unsigned long)(addr))
++#elif defined(__riscv)
++#define ksu_mvf_set_pc(regs, addr) ((regs)->epc = (unsigned long)(addr))
++#endif
++
++static int ksu_mvf_kprobe_pre(struct kprobe *kp, struct pt_regs *regs)
++{
++    struct ksu_mvf_hook *hook = container_of(kp, struct ksu_mvf_hook, kp);
++
++    if (!smp_load_acquire(&ksu_mvf_enabled))
++        return 0;
++
++    /* system uids are never filtered, so their opens do not need the detour */
++    if (likely(current_uid().val < 10000))
++        return 0;
++
++    if (ksu_mvf_task_marked())
++        return 0;
++
++    if (!hook->replacement)
++        return 0;
++
++    ksu_mvf_set_pc(regs, hook->replacement);
++
++    return 1;
++}
++
+ static int ksu_mvf_install_hooks(void)
+ {
+     unsigned int i;
+@@ -335,8 +411,19 @@
+         }
+         ret = ksu_patch_text(hook->open_slot, &wrapper, sizeof(wrapper), KSU_PATCH_TEXT_FLUSH_DCACHE);
+         if (ret) {
+-            pr_err("mount_view_filter: failed to hook %s: %d\n", hook->name, ret);
+-            return ret;
++            pr_warn("mount_view_filter: patch_text %s err: %d, try kprobe\n", hook->name, ret);
++            memset(&hook->kp, 0, sizeof(hook->kp));
++            hook->replacement = wrapper;
++            hook->kp.addr = (kprobe_opcode_t *)hook->original_open;
++            hook->kp.pre_handler = ksu_mvf_kprobe_pre;
++            ret = register_kprobe(&hook->kp);
++            if (ret) {
++                pr_err("mount_view_filter: register_kprobe(%s) failed: %d\n", hook->name, ret);
++                hook->replacement = NULL;
++                return ret;
++            }
++            hook->kprobed = true;
++            pr_info("mount_view_filter: %s hooked via kprobe -> %ps\n", hook->name, wrapper);
+         }
+         hook->patched = true;
+     }
+@@ -354,6 +441,14 @@
+ 
+         if (!hook->patched)
+             continue;
++        if (hook->kprobed) {
++            unregister_kprobe(&hook->kp);
++            hook->kprobed = false;
++            hook->patched = false;
++            hook->replacement = NULL;
++            pr_info("mount_view_filter: %s kprobe removed\n", hook->name);
++            continue;
++        }
+         if (READ_ONCE(*hook->open_slot) != ksu_mvf_open_wrapper(i)) {
+             pr_warn("mount_view_filter: %s open slot was replaced externally\n", hook->name);
+             hook->patched = false;

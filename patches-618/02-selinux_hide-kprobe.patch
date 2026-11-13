@@ -1,1 +1,375 @@
-
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -27,6 +27,11 @@
+ #include "avc.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "linux/kallsyms.h"
++#include <linux/kprobes.h>
++#include <linux/xarray.h>
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/gfp.h>
+ #include "objsec.h"
+ #include "hook/patch_memory.h"
+ #include "ksu.h"
+@@ -87,6 +92,161 @@
+ static write_op_fn orig_context_write, orig_access_write;
+ #endif
+ 
++/*
++ * Some vendor kernels write protect the SELinux function pointer slots we normally
++ * overwrite, so ksu_patch_text() fails there with -EFAULT. For those slots a kprobe is
++ * registered on the original function entry and the PC is pointed at a trampoline, which
++ * is an ordinary tail jump: the probe leaves x30 untouched, so the trampoline's return
++ * goes straight back to the caller.
++ *
++ * The pre_handler never redirects uid < 10000. Boot and system processes have to run the
++ * original function, and letting them into the replacement would make its call_orig()
++ * path re-enter the same probed entry.
++ */
++struct ksu_selinux_hide_slot {
++    const char *name;
++    void *target;
++    void *replacement;
++    struct kprobe kp;
++    bool armed;
++};
++
++/*
++ * Per-task recursion guard: the replacement runs with the task marked, so a nested call
++ * into the same probed entry is let through to the original code. A per-CPU counter
++ * cannot be used, my_write_context() sleeps while the hook is active.
++ */
++static DEFINE_XARRAY(ksu_selinux_hide_tasks);
++
++static bool ksu_selinux_hide_task_marked(void)
++{
++    return xa_load(&ksu_selinux_hide_tasks, (unsigned long)current) != NULL;
++}
++
++static void ksu_selinux_hide_task_mark(void)
++{
++    xa_store(&ksu_selinux_hide_tasks, (unsigned long)current, xa_mk_value(1), GFP_ATOMIC);
++}
++
++static void ksu_selinux_hide_task_clear(void)
++{
++    xa_erase(&ksu_selinux_hide_tasks, (unsigned long)current);
++}
++
++#if defined(__aarch64__)
++#define ksu_kprobe_set_pc(regs, addr) ((regs)->pc = (unsigned long)(addr))
++#elif defined(__x86_64__)
++#define ksu_kprobe_set_pc(regs, addr) ((regs)->ip = (unsigned long)(addr))
++#elif defined(__riscv)
++#define ksu_kprobe_set_pc(regs, addr) ((regs)->epc = (unsigned long)(addr))
++#endif
++
++static int ksu_selinux_hide_pre_handler(struct kprobe *p, struct pt_regs *regs)
++{
++    struct ksu_selinux_hide_slot *slot = container_of(p, struct ksu_selinux_hide_slot, kp);
++
++    if (!READ_ONCE(ksu_selinux_hide_enabled))
++        return 0;
++
++    if (likely(current_uid().val < 10000))
++        return 0;
++
++    if (ksu_selinux_hide_task_marked())
++        return 0;
++
++    if (!slot->replacement)
++        return 0;
++
++    ksu_kprobe_set_pc(regs, slot->replacement);
++
++    /* PC redirected, skip the single-step of the original instruction. */
++    return 1;
++}
++
++static int ksu_selinux_hide_kprobe_arm(struct ksu_selinux_hide_slot *slot)
++{
++    int ret;
++
++    if (slot->armed)
++        return 0;
++
++    memset(&slot->kp, 0, sizeof(slot->kp));
++    slot->kp.addr = (kprobe_opcode_t *)slot->target;
++    slot->kp.pre_handler = ksu_selinux_hide_pre_handler;
++
++    ret = register_kprobe(&slot->kp);
++    if (ret) {
++        pr_err("selinux_hide: init: kprobe %s err: %d\n", slot->name, ret);
++        return ret;
++    }
++
++    slot->armed = true;
++    pr_info("selinux_hide: %s kprobe armed -> trampoline %ps\n", slot->name, slot->replacement);
++
++    return 0;
++}
++
++static int ksu_selinux_hide_install_slot(struct ksu_selinux_hide_slot *slot, void **dst, void *replacement)
++{
++    int ret;
++
++    slot->target = *dst;
++    slot->replacement = replacement;
++
++    ret = ksu_patch_text(dst, &replacement, sizeof(replacement), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (!ret) {
++        pr_info("selinux_hide: %s slot patched\n", slot->name);
++        return 0;
++    }
++
++    pr_err("selinux_hide: init: patch_text %s err: %d, try kprobe\n", slot->name, ret);
++
++    return ksu_selinux_hide_kprobe_arm(slot);
++}
++
++static void ksu_selinux_hide_remove_slot(struct ksu_selinux_hide_slot *slot, void **dst, void *orig)
++{
++    int ret;
++
++    if (slot->armed) {
++        unregister_kprobe(&slot->kp);
++        slot->armed = false;
++        pr_info("selinux_hide: %s kprobe removed\n", slot->name);
++        return;
++    }
++
++    if (!slot->replacement || !dst || !orig)
++        return;
++
++    slot->replacement = NULL;
++    ret = ksu_patch_text(dst, &orig, sizeof(orig), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret)
++        pr_err("selinux_hide: exit: patch_text %s err: %d\n", slot->name, ret);
++}
++
++/* the injected ksu type is not part of the backup policy: answer the way the kernel
++ * answers a missing type instead of leaking an avc denial */
++static bool ksu_selinux_hide_ksu_context(const char *buf, size_t size)
++{
++    size_t i;
++
++    if (!buf)
++        return false;
++
++    for (i = 0; i + 4 < size; i++) {
++        if (buf[i] == ':' && buf[i + 1] == 'k' && buf[i + 2] == 's' && buf[i + 3] == 'u' &&
++            (buf[i + 4] == ':' || buf[i + 4] == '_'))
++            return true;
++    }
++
++    return false;
++}
++
++static struct ksu_selinux_hide_slot status_open_slot = { .name = "status_open" };
++static struct ksu_selinux_hide_slot context_write_slot = { .name = "context_write" };
++static struct ksu_selinux_hide_slot access_write_slot = { .name = "access_write" };
++static struct ksu_selinux_hide_slot setprocattr_slot = { .name = "setprocattr" };
++
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+ #define ksu_avc_has_perm_compat(...) avc_has_perm(__VA_ARGS__)
+ #define ksu_security_bounded_transition_compat(...) security_bounded_transition(__VA_ARGS__)
+@@ -109,6 +269,8 @@
+         return orig_context_write(file, buf, size);
+     }
+ #endif
++    if (ksu_selinux_hide_ksu_context(buf, size))
++        return -EINVAL;
+     char *canon = NULL;
+     u32 sid, len;
+     ssize_t length;
+@@ -377,6 +539,55 @@
+     return ret;
+ }
+ 
++/*
++ * kprobe trampolines. They are the kprobe redirect targets: mark the task, run the
++ * replacement, unmark. The patch_text path installs the my_* functions directly and
++ * needs no marking.
++ */
++static ssize_t ksu_selinux_hide_tramp_context(struct file *file, char *buf, size_t size)
++{
++    ssize_t ret;
++
++    ksu_selinux_hide_task_mark();
++    ret = my_write_context(file, buf, size);
++    ksu_selinux_hide_task_clear();
++
++    return ret;
++}
++
++static ssize_t ksu_selinux_hide_tramp_access(struct file *file, char *buf, size_t size)
++{
++    ssize_t ret;
++
++    ksu_selinux_hide_task_mark();
++    ret = my_write_access(file, buf, size);
++    ksu_selinux_hide_task_clear();
++
++    return ret;
++}
++
++static int ksu_selinux_hide_tramp_status(struct inode *inode, struct file *filp)
++{
++    int ret;
++
++    ksu_selinux_hide_task_mark();
++    ret = my_sel_open_handle_status(inode, filp);
++    ksu_selinux_hide_task_clear();
++
++    return ret;
++}
++
++static int __nocfi ksu_selinux_hide_tramp_setprocattr(const char *name, void *value, size_t size)
++{
++    int ret;
++
++    ksu_selinux_hide_task_mark();
++    ret = my_setprocattr(name, value, size);
++    ksu_selinux_hide_task_clear();
++
++    return ret;
++}
++
+ static void __maybe_unused hook_selinux_status_open();
+ static void ksu_selinux_hide_unhook();
+ static int ksu_selinux_hide_enable()
+@@ -408,67 +619,66 @@
+ 
+     context_write = &selinux_write_op[SEL_CONTEXT];
+     pr_info("selinux_hide: context_write: 0x%lx [%pSb]\n", (unsigned long)*context_write, *context_write);
+-    write_op_fn my = my_write_context;
+     orig_context_write = *context_write;
+-    ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-    if (ret) {
+-        pr_err("selinux_hide: init: patch_text context_write err: %d\n", ret);
+-        goto unhook;
++    if (!orig_context_write) {
++        pr_err("selinux_hide: context_write is NULL\n");
++    } else if (ksu_selinux_hide_install_slot(&context_write_slot, (void **)context_write,
++                                             (void *)ksu_selinux_hide_tramp_context)) {
++        pr_err("selinux_hide: context slot degraded; other slots continue\n");
+     }
+ 
+     access_write = &selinux_write_op[SEL_ACCESS];
+     pr_info("selinux_hide: access_write: 0x%lx [%pSb]\n", (unsigned long)*access_write, *access_write);
+-    my = my_write_access;
+     orig_access_write = *access_write;
+-    ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-    if (ret) {
+-        pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
+-        goto unhook;
++    if (!orig_access_write) {
++        pr_err("selinux_hide: access_write is NULL\n");
++    } else if (ksu_selinux_hide_install_slot(&access_write_slot, (void **)access_write,
++                                             (void *)ksu_selinux_hide_tramp_access)) {
++        pr_err("selinux_hide: access slot degraded; other slots continue\n");
+     }
+ 
++    /* when the kprobe path is taken the slot stays untouched, so the lsm hook has to be
++     * skipped and the real function reached through the probe */
+     ret = ksu_lsm_hook(&selinux_setprocattr_hook);
+     if (ret) {
+-        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
+-        goto unhook;
++        unsigned long target = find_kernel_symbol_exact("selinux_setprocattr");
++
++        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d, try kprobe\n", ret);
++        if (!target) {
++            pr_err("selinux_hide: selinux_setprocattr not found; kprobe fallback unavailable\n");
++        } else {
++            selinux_setprocattr_hook.original = (void *)target;
++            setprocattr_slot.target = (void *)target;
++            setprocattr_slot.replacement = (void *)ksu_selinux_hide_tramp_setprocattr;
++            if (ksu_selinux_hide_kprobe_arm(&setprocattr_slot)) {
++                selinux_setprocattr_hook.original = NULL;
++                pr_err("selinux_hide: setprocattr slot degraded\n");
++            }
++        }
+     }
+ 
+     return 0;
+-
+-unhook:
+-    ksu_selinux_hide_unhook();
+-    return -ENOSYS;
+ #endif
+ }
+ 
+ static void ksu_selinux_hide_unhook()
+ {
+-    int ret;
+ #ifndef CONFIG_KSU_SUSFS
+-    if (orig_context_write) {
+-        ret =
+-            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-        orig_context_write = NULL;
+-        if (ret) {
+-            pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
+-        }
+-    }
+-    if (orig_access_write) {
+-        ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-        orig_access_write = NULL;
+-        if (ret) {
+-            pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
+-        }
+-    }
++    ksu_selinux_hide_remove_slot(&context_write_slot, (void **)context_write, orig_context_write);
++    orig_context_write = NULL;
++
++    ksu_selinux_hide_remove_slot(&access_write_slot, (void **)access_write, orig_access_write);
++    orig_access_write = NULL;
+ #endif
+-    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+-        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+-                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-        orig_sel_open_handle_status = NULL;
+-        if (ret) {
+-            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
+-        }
+-    }
++    ksu_selinux_hide_remove_slot(&status_open_slot, (void **)sel_open_handle_status_slot,
++                                 orig_sel_open_handle_status);
++    orig_sel_open_handle_status = NULL;
++
+ #ifndef CONFIG_KSU_SUSFS
++    if (setprocattr_slot.armed) {
++        ksu_selinux_hide_remove_slot(&setprocattr_slot, NULL, NULL);
++        selinux_setprocattr_hook.original = NULL;
++    }
+     ksu_lsm_unhook(&selinux_setprocattr_hook);
+ #endif
+ }
+@@ -547,11 +757,10 @@
+         }
+         sel_open_handle_status_slot = &ops->open;
+     }
+-    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
+     orig_sel_open_handle_status = *sel_open_handle_status_slot;
+-    int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
+-    if (ret) {
+-        pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\n", ret);
++    if (ksu_selinux_hide_install_slot(&status_open_slot, (void **)sel_open_handle_status_slot,
++                                      (void *)ksu_selinux_hide_tramp_status)) {
++        pr_err("selinux_hide: status slot degraded (neither patch nor kprobe)\n");
+         sel_open_handle_status_slot = NULL;
+         orig_sel_open_handle_status = NULL;
+     }
+@@ -580,6 +789,11 @@
+         ksu_selinux_hide_running = false;
+     }
+     mutex_unlock(&selinux_hide_mutex);
++    /* the status slot is hooked from init, it has to go even when the feature was never
++     * enabled */
++    ksu_selinux_hide_remove_slot(&status_open_slot, (void **)sel_open_handle_status_slot,
++                                 orig_sel_open_handle_status);
++    orig_sel_open_handle_status = NULL;
+     ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
+     mutex_lock(&selinux_state.status_lock);
+     if (fake_status)
