@@ -39,8 +39,8 @@
     <string name="home_version">Version</string>
     <string name="home_running_mode">Run mode</string>
     <string name="home_hook_type">Hook type</string>
-    <string name="home_hook_type_tracepoint">Tracepoint</string>
-    <string name="home_hook_type_susfs_inline">SUSFS Inline</string>
+    <string name="home_hook_type_tracepoint">Tracepoint Syscall Redirect</string>
+    <string name="home_hook_type_susfs_inline">SUSFS Inline Syscall Redirect</string>
     <string name="home_hook_type_unknown">Legacy / unknown</string>
     <string name="home_hook_type_failed">%1$s (abnormal)</string>
     <string name="home_running_status">Running status</string>
@@ -824,7 +824,6 @@
     <string name="wallpaper_crop_message">Crop the image to fit the screen, or use it as is?</string>
     <string name="wallpaper_crop_confirm">Crop</string>
     <string name="wallpaper_crop_direct">Use as is</string>
-    <string name="surface_crop_reset_ratio">Reset ratio</string>
     <string name="wallpaper_saved">Wallpaper updated</string>
     <string name="wallpaper_removed">Wallpaper removed</string>
     <string name="wallpaper_save_failed">Failed to load the image</string>

@@ -21,6 +21,11 @@ struct selinux_policy *backup_sepolicy;
 
 #define ALL NULL
 
+#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
+extern int susfs_add_sus_avd_allowed_by_type(u32 s_type, u32 t_type, u32 type, u32 orig_avd_allowed);
+extern int susfs_add_sus_type(const char *secctx, u32 type_value);
+#endif
+
 #if (LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0))
 extern int avc_ss_reset(u32 seqno);
 #else
@@ -84,9 +89,11 @@ void apply_kernelsu_rules()
 
     db = &pol->policydb;
 
+#if !defined(CONFIG_KSU_SUSFS) || !defined(KSU_SUSFS_HAS_TYPE_REGISTRATION)
     pol->latest_granting = old_pol->latest_granting + 1;
     if (!ksu_set_original_types(db, &old_pol->policydb, pol->latest_granting))
         pr_warn("failed to save original type metadata, use backup lookups\n");
+#endif
 
     ksu_type(db, KERNEL_SU_DOMAIN, "domain");
     ksu_permissive(db, KERNEL_SU_DOMAIN);
@@ -169,7 +176,11 @@ void apply_kernelsu_rules()
     synchronize_rcu();
     ksu_destroy_sepolicy(old_pol);
 
+#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
+    reset_avc_cache(0);
+#else
     reset_avc_cache(pol->latest_granting);
+#endif
 #ifdef CONFIG_KSU_SUSFS
     susfs_set_batch_sid();
 #endif
@@ -527,15 +538,21 @@ int handle_sepolicy(void __user *user_data, u64 data_len)
         cmd_index++;
     }
 
+#if !defined(CONFIG_KSU_SUSFS) || !defined(KSU_SUSFS_HAS_TYPE_REGISTRATION)
     pol->latest_granting = old_pol->latest_granting + 1;
     if (!ksu_advance_original_types(db, &old_pol->policydb, old_pol->latest_granting, pol->latest_granting))
         pr_warn("failed to carry original type metadata, use backup lookups\n");
+#endif
 
     rcu_assign_pointer(selinux_state.policy, pol);
     synchronize_rcu();
     ksu_destroy_sepolicy(old_pol);
 
+#ifdef KSU_SUSFS_HAS_TYPE_REGISTRATION
+    reset_avc_cache(0);
+#else
     reset_avc_cache(pol->latest_granting);
+#endif
 #ifdef CONFIG_KSU_SUSFS
     susfs_set_batch_sid();
 #endif
