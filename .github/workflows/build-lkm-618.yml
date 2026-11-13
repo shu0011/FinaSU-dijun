@@ -48,6 +48,9 @@ jobs:
           CONFIG_KSU=m CC=clang make KSU_REQUIRE_PREINIT=1
           mkdir -p "$GITHUB_WORKSPACE/out"
           cp kernelsu.ko "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko"
+          # --strip-debug only: drop .debug_* / .rela.debug_* (95% of the file), keep
+          # .symtab/.strtab (preinit runner, symbol resolution) and .BTF
+          llvm-strip -d "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko"
           ls -l "$GITHUB_WORKSPACE/out"
           modinfo "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko" | head -20 || true
 
