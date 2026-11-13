@@ -1,0 +1,58 @@
+name: Build kernelsu.ko for FinaSU (android17-6.18)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'FinaSU branch/tag/commit to build'
+        required: false
+        default: 'master'
+        type: string
+
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/ylarod/ddk-min:android17-6.18-20260828
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Fetch FinaSU and apply patches
+        run: |
+          set -eux
+          git clone https://github.com/LyraVoid/FinaSU "$GITHUB_WORKSPACE/src"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/src"
+          cd "$GITHUB_WORKSPACE/src"
+          git checkout "${{ inputs.ref }}"
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/patches-618/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::no patches-618/*.patch in this repository"
+            exit 1
+          fi
+          for p in "${patches[@]}"; do
+            echo "applying $p"
+            if ! git apply -v "$p"; then
+              echo "::error::$p does not apply - its target file changed upstream, regenerate that patch"
+              exit 1
+            fi
+          done
+          git diff --stat
+
+      - name: Build kernelsu.ko
+        run: |
+          set -eux
+          cd "$GITHUB_WORKSPACE/src/kernel"
+          CONFIG_KSU=m CC=clang make KSU_REQUIRE_PREINIT=1
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp kernelsu.ko "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko"
+          ls -l "$GITHUB_WORKSPACE/out"
+          modinfo "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko" | head -20 || true
+
+      - name: Upload kernelsu.ko
+        uses: actions/upload-artifact@v7
+        with:
+          name: finasu-kernelsu-android17-6.18
+          path: out/android17-6.18_kernelsu.ko
