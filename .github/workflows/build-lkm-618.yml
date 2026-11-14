@@ -8,6 +8,14 @@ on:
         required: false
         default: 'master'
         type: string
+      manager_tag:
+        description: '管理器 release tag（留空 = 自动取 FinaSU 最新发布）'
+        required: false
+        default: ''
+        type: string
+
+env:
+  MANAGER_REPO: LyraVoid/FinaSU
 
 jobs:
   build-aarch64:
@@ -18,6 +26,52 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+
+      # 为什么要先解管理器身份：
+      #   FinaSU 的 kernel/Kbuild 在没传 KSU_EXPECTED_SIZE2 / KSU_EXPECTED_HASH2 时，
+      #   会把 FINASU_TRUSTED_HASH 回落成 KSU_EXPECTED_HASH（官方 KernelSU 证书
+      #   c371061b…）。apk_sign_keys[0] 名字写着 "FinaSU"，实际信任的却是 KernelSU
+      #   签名 → 管理器加冕落在 KernelSU 管理器上，FinaSU 管理器不被识别。
+      #   每次构建都从最新 release 现取证书，换了签名或换了包名都能自动跟上。
+      - name: 取最新 FinaSU 管理器并解出身份
+        id: mgr
+        run: |
+          set -euo pipefail
+
+          need=()
+          command -v python3 >/dev/null 2>&1 || need+=(python3)
+          command -v curl >/dev/null 2>&1 || need+=(curl)
+          if [ ${#need[@]} -gt 0 ]; then
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends "${need[@]}" ca-certificates
+          fi
+
+          AUTH=()
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            AUTH=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+          fi
+          api="https://api.github.com/repos/${MANAGER_REPO}"
+          get() { curl -fsSL ${AUTH[@]+"${AUTH[@]}"} "$1"; }
+
+          tag="${{ inputs.manager_tag }}"
+          if [ -z "$tag" ]; then
+            tag=$(get "$api/releases/latest" | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+          fi
+          echo "管理器版本: $tag"
+
+          url=$(get "$api/releases/tags/$tag" | python3 -c 'import json,sys; d=json.load(sys.stdin); a=[x for x in d["assets"] if x["name"].endswith(".apk")]; p=[x for x in a if "release" in x["name"]] or a; print(p[0]["browser_download_url"] if p else "")')
+          if [ -z "$url" ]; then
+            echo "::error::$MANAGER_REPO 的 release $tag 里没有 apk 资产"
+            exit 1
+          fi
+          echo "下载: $url"
+          curl -fsSL -o "$GITHUB_WORKSPACE/finasu-manager.apk" "$url"
+          ls -l "$GITHUB_WORKSPACE/finasu-manager.apk"
+
+          python3 "$GITHUB_WORKSPACE/tools/manager_identity.py" \
+              "$GITHUB_WORKSPACE/finasu-manager.apk" | tee "$GITHUB_WORKSPACE/mgr.txt"
+          cat "$GITHUB_WORKSPACE/mgr.txt" >> "$GITHUB_OUTPUT"
+          echo "manager_tag=$tag" >> "$GITHUB_OUTPUT"
 
       - name: Fetch FinaSU and apply patches
         run: |
@@ -43,10 +97,29 @@ jobs:
 
       - name: Build kernelsu.ko
         run: |
-          set -eux
-          cd "$GITHUB_WORKSPACE/src/kernel"
-          CONFIG_KSU=m CC=clang make KSU_REQUIRE_PREINIT=1
+          set -euxo pipefail
           mkdir -p "$GITHUB_WORKSPACE/out"
+          cd "$GITHUB_WORKSPACE/src/kernel"
+
+          CONFIG_KSU=m CC=clang make \
+            KSU_REQUIRE_PREINIT=1 \
+            KSU_EXPECTED_SIZE2="${{ steps.mgr.outputs.cert_size }}" \
+            KSU_EXPECTED_HASH2="${{ steps.mgr.outputs.cert_sha256 }}" \
+            KSU_SECOND_SIGNATURE_RELEASE=1 \
+            2>&1 | tee "$GITHUB_WORKSPACE/out/build.log"
+
+          # Kbuild 必须真的吃进了这两个值，否则又回落成 KernelSU 证书
+          grep -q "KernelSU Manager signature size2: ${{ steps.mgr.outputs.cert_size }}" \
+            "$GITHUB_WORKSPACE/out/build.log"
+          grep -q "KernelSU Manager signature hash2: ${{ steps.mgr.outputs.cert_sha256 }}" \
+            "$GITHUB_WORKSPACE/out/build.log"
+          grep -q "KernelSU Manager second signature is a release key" \
+            "$GITHUB_WORKSPACE/out/build.log"
+
+          # 再从产物里把第 0 信任槽读回来比一次
+          python3 "$GITHUB_WORKSPACE/tools/manager_identity.py" \
+            --verify-module kernelsu.ko "$GITHUB_WORKSPACE/finasu-manager.apk" >/dev/null
+
           cp kernelsu.ko "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko"
           # --strip-debug only: drop .debug_* / .rela.debug_* (95% of the file), keep
           # .symtab/.strtab (preinit runner, symbol resolution) and .BTF
@@ -54,8 +127,24 @@ jobs:
           ls -l "$GITHUB_WORKSPACE/out"
           modinfo "$GITHUB_WORKSPACE/out/android17-6.18_kernelsu.ko" | head -20 || true
 
+      - name: 记录管理器身份
+        run: |
+          set -euo pipefail
+          {
+            echo "manager_repo=$MANAGER_REPO"
+            echo "manager_tag=${{ steps.mgr.outputs.manager_tag }}"
+            echo "package=${{ steps.mgr.outputs.package }}"
+            echo "version_code=${{ steps.mgr.outputs.version_code }}"
+            echo "cert_size=${{ steps.mgr.outputs.cert_size }}"
+            echo "cert_sha256=${{ steps.mgr.outputs.cert_sha256 }}"
+            echo "finasu_ref=${{ inputs.ref }}"
+          } | tee "$GITHUB_WORKSPACE/out/manager-identity.txt"
+
       - name: Upload kernelsu.ko
         uses: actions/upload-artifact@v7
         with:
           name: finasu-kernelsu-android17-6.18
-          path: out/android17-6.18_kernelsu.ko
+          path: |
+            out/android17-6.18_kernelsu.ko
+            out/manager-identity.txt
+            out/build.log
